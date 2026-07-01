@@ -13,7 +13,7 @@ const MIN_CLIMB_HEIGHT = 100;
 const MAX_CLIMB_HEIGHT = 200;
 const BOUNCE_DAMP = 0.45;
 const VX_DAMP = 0.75;
-const SPRITE_VARIANTS = ['/browny.png', '/pika.png', '/purple.png', '/red.png', '/green.png', '/white.png', '/blue.png', '/panda.png'];
+const SPRITE_VARIANTS = ['/browny.png', '/pika.png', '/purple.png', '/red.png', '/green.png', '/white.png', '/blue.png', '/panda.png', '/cyberpunk.png', '/orange.png', '/pink.png', '/sphynx.png', '/pika-blue.png'];
 const WOMBAT_COUNT = SPRITE_VARIANTS.length;
 const HEAD_PIVOT_Y = DISPLAY_SIZE * 0.18;
 
