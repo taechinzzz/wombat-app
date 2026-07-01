@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { supabase } from '../../lib/supabase';
 
 const SPRITE_SIZE = 32;
 const SCALE = 2;
@@ -13,9 +14,59 @@ const MIN_CLIMB_HEIGHT = 100;
 const MAX_CLIMB_HEIGHT = 200;
 const BOUNCE_DAMP = 0.45;
 const VX_DAMP = 0.75;
-const SPRITE_VARIANTS = ['/browny.png', '/pika.png', '/purple.png', '/red.png', '/green.png', '/white.png', '/blue.png', '/panda.png', '/cyberpunk.png', '/orange.png', '/pink.png', '/sphynx.png', '/pika-blue.png'];
+const SPRITE_VARIANTS = ['/browny.png', '/pika.png', '/purple.png', '/red.png', '/green.png', '/white.png', '/blue.png', '/panda.png', '/cyberpunk.png', '/orange.png', '/pink.png', '/sphynx.png', '/pika-blue.png', '/neongreen.png'];
 const WOMBAT_COUNT = SPRITE_VARIANTS.length;
 const HEAD_PIVOT_Y = DISPLAY_SIZE * 0.18;
+
+const PLAYER_COLORS = [
+  '#8B6234', '#D4A000', '#9B59B6', '#E74C3C', '#27AE60',
+  '#888888', '#2980B9', '#555555', '#00B0CC', '#E67E22',
+  '#E91E8C', '#C4A882', '#5DADE2', '#22CC00',
+];
+
+function hashToVariant(id: string): number {
+  let h = 0;
+  for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return h % SPRITE_VARIANTS.length;
+}
+
+function drawNameTag(ctx: CanvasRenderingContext2D, cx: number, top: number, name: string) {
+  ctx.save();
+  ctx.font = 'bold 10px sans-serif';
+  ctx.textAlign = 'center';
+  const tw = Math.min(ctx.measureText(name).width + 10, 120);
+  const th = 14;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.beginPath();
+  (ctx as CanvasRenderingContext2D & { roundRect: (...a: unknown[]) => void })
+    .roundRect(cx - tw / 2, top - th, tw, th, 3);
+  ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(name, cx, top - 3);
+  ctx.restore();
+}
+
+function drawChatBubble(ctx: CanvasRenderingContext2D, cx: number, top: number, text: string) {
+  ctx.save();
+  ctx.font = '10px sans-serif';
+  ctx.textAlign = 'center';
+  let t = text;
+  while (ctx.measureText(t).width > 150 && t.length > 1) t = t.slice(0, -1);
+  if (t !== text) t = t.slice(0, -1) + '…';
+  const tw = ctx.measureText(t).width + 14;
+  const th = 16;
+  ctx.fillStyle = 'rgba(255,255,255,0.93)';
+  ctx.strokeStyle = '#ccc';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  (ctx as CanvasRenderingContext2D & { roundRect: (...a: unknown[]) => void })
+    .roundRect(cx - tw / 2, top - th, tw, th, 4);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = '#333';
+  ctx.fillText(t, cx, top - 4);
+  ctx.restore();
+}
 
 const BALL_SPRITE_SIZE = 16;
 const BALL_DISPLAY_SIZE = BALL_SPRITE_SIZE * SCALE;
@@ -498,7 +549,41 @@ function drawBall(ctx: CanvasRenderingContext2D, img: HTMLImageElement, x: numbe
   ctx.restore();
 }
 
-export default function WombatCanvas() {
+interface RemotePlayer {
+  playerId: string;
+  name: string;
+  spriteVariant: number;
+  x: number;
+  y: number;
+  facingRight: boolean;
+  animRow: number;
+  animFrameIdx: number;
+  chatMsg: string;
+  chatTs: number;
+}
+
+interface ChatMessage {
+  id: string;
+  playerId: string;
+  name: string;
+  spriteVariant: number;
+  text: string;
+  ts: number;
+}
+
+const REROLL_DURATION = 1400;
+const REROLL_SEQ: Sequence = [{ anim: 'balling', loops: 9999 }];
+
+interface WombatCanvasProps {
+  playerId: string;
+  playerName: string;
+  spriteVariantOverride?: number | null;
+  onKick?: () => void;
+  pendingVariant?: number | null;
+  isRerolling?: boolean;
+}
+
+export default function WombatCanvas({ playerId, playerName, spriteVariantOverride, onKick, pendingVariant, isRerolling }: WombatCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const statesRef = useRef<State[]>([]);
   const pooRef = useRef<PooParticle[]>([]);
@@ -511,6 +596,64 @@ export default function WombatCanvas() {
     velX: number; velY: number;
     targetX: number; targetY: number;
   } | null>(null);
+
+  const remotePlayersRef = useRef<Map<string, RemotePlayer>>(new Map());
+  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const ownChatRef = useRef<{ message: string; ts: number }>({ message: '', ts: 0 });
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const ownVariant = spriteVariantOverride ?? hashToVariant(playerId);
+  const onKickRef = useRef(onKick);
+  useEffect(() => { onKickRef.current = onKick; }, [onKick]);
+
+  const isRerollingRef = useRef(isRerolling);
+  useEffect(() => { isRerollingRef.current = isRerolling; }, [isRerolling]);
+  const pendingVariantRef = useRef(pendingVariant);
+  useEffect(() => { pendingVariantRef.current = pendingVariant; }, [pendingVariant]);
+  const rerollStartRef = useRef(0);
+
+  // When rerolling starts: force balling animation in place
+  useEffect(() => {
+    if (isRerolling && statesRef.current[0]) {
+      rerollStartRef.current = performance.now();
+      statesRef.current[0] = {
+        ...statesRef.current[0],
+        seq: REROLL_SEQ, stepIdx: 0, elapsed: 0, timer: 0,
+        mode: 'ground', ignoreChase: REROLL_DURATION + 500,
+      };
+    } else if (!isRerolling && statesRef.current[0] && statesRef.current[0].seq === REROLL_SEQ) {
+      statesRef.current[0] = { ...statesRef.current[0], seq: pickSeq(), stepIdx: 0, elapsed: 0 };
+    }
+  }, [isRerolling]);
+
+  useEffect(() => {
+    if (statesRef.current[0]) {
+      statesRef.current[0] = { ...statesRef.current[0], spriteVariant: ownVariant };
+    }
+  }, [ownVariant]);
+
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+
+  useEffect(() => {
+    if (chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    }
+  }, [chatHistory]);
+
+  const handleSendChat = () => {
+    const text = chatInput.trim();
+    if (!text || !channelRef.current) return;
+    const s = statesRef.current[0];
+    const sv = s?.spriteVariant ?? ownVariant;
+    const msg: ChatMessage = {
+      id: Math.random().toString(36).slice(2),
+      playerId, name: playerName, spriteVariant: sv, text, ts: Date.now(),
+    };
+    ownChatRef.current = { message: text, ts: Date.now() };
+    channelRef.current.send({ type: 'broadcast', event: 'chat', payload: msg });
+    setChatHistory(prev => [...prev.slice(-49), msg]);
+    setChatInput('');
+  };
 
   useEffect(() => {
     const canvas = canvasRef.current!;
@@ -535,9 +678,9 @@ export default function WombatCanvas() {
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
       if (statesRef.current.length === 0) {
-        statesRef.current = Array.from({ length: WOMBAT_COUNT }, (_, i) =>
-          initWombat(i, canvas.width, getGroundY())
-        );
+        const own = initWombat(0, canvas.width, getGroundY());
+        own.spriteVariant = hashToVariant(playerId);
+        statesRef.current = [own];
         ballRef.current = { x: canvas.width / 2, y: getGroundY() - BALL_RADIUS - BALL_GROUND_OFFSET, vx: 0, vy: 0, rotation: 0 };
       }
     };
@@ -677,6 +820,7 @@ export default function WombatCanvas() {
           if (s.wantsKick) {
             ball.vx = s.kickVx;
             ball.vy = s.kickVy;
+            onKickRef.current?.();
           }
         }
 
@@ -720,8 +864,9 @@ export default function WombatCanvas() {
           }
         }
 
-        for (let i = 0; i < WOMBAT_COUNT; i++) {
-          const { x, y, facingRight, seq, stepIdx, elapsed, mode, swingAngle, spriteVariant } = statesRef.current[i];
+        // Draw own wombat
+        if (statesRef.current[0]) {
+          const { x, y, facingRight, seq, stepIdx, elapsed, mode, swingAngle, spriteVariant } = statesRef.current[0];
           const step = seq[stepIdx];
           const fIdx = getFrameIdx(elapsed, step.anim);
           const { row } = ANIMS[step.anim];
@@ -730,16 +875,60 @@ export default function WombatCanvas() {
           const angle = mode === 'dragging' ? swingAngle : 0;
           const wombatImg = wombatImgs[spriteVariant];
 
-          ctx.save();
-          ctx.translate(x + DISPLAY_SIZE / 2, y + HEAD_PIVOT_Y);
-          ctx.rotate(angle);
-          if (facingRight) {
-            ctx.drawImage(wombatImg, sx, sy, SPRITE_SIZE, SPRITE_SIZE, -DISPLAY_SIZE / 2, -HEAD_PIVOT_Y, DISPLAY_SIZE, DISPLAY_SIZE);
+          // Crossfade to new color while rerolling
+          const rerolling = isRerollingRef.current;
+          const pv = pendingVariantRef.current;
+          const progress = rerolling
+            ? Math.min(1, (performance.now() - rerollStartRef.current) / REROLL_DURATION)
+            : 0;
+
+          const drawSprite = (img: HTMLImageElement, alpha: number) => {
+            if (alpha <= 0) return;
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.translate(x + DISPLAY_SIZE / 2, y + HEAD_PIVOT_Y);
+            ctx.rotate(angle);
+            if (facingRight) {
+              ctx.drawImage(img, sx, sy, SPRITE_SIZE, SPRITE_SIZE, -DISPLAY_SIZE / 2, -HEAD_PIVOT_Y, DISPLAY_SIZE, DISPLAY_SIZE);
+            } else {
+              ctx.scale(-1, 1);
+              ctx.drawImage(img, sx, sy, SPRITE_SIZE, SPRITE_SIZE, -DISPLAY_SIZE / 2, -HEAD_PIVOT_Y, DISPLAY_SIZE, DISPLAY_SIZE);
+            }
+            ctx.restore();
+          };
+
+          if (rerolling && pv != null && wombatImgs[pv]?.complete) {
+            drawSprite(wombatImg, 1 - progress);
+            drawSprite(wombatImgs[pv as number], progress);
           } else {
-            ctx.scale(-1, 1);
-            ctx.drawImage(wombatImg, sx, sy, SPRITE_SIZE, SPRITE_SIZE, -DISPLAY_SIZE / 2, -HEAD_PIVOT_Y, DISPLAY_SIZE, DISPLAY_SIZE);
+            drawSprite(wombatImg, 1);
           }
+          const cx = x + DISPLAY_SIZE / 2;
+          const tagTop = y + HEAD_PIVOT_Y - 2;
+          if (ownChatRef.current.message && Date.now() - ownChatRef.current.ts < 5000) {
+            drawChatBubble(ctx, cx, tagTop - 28, ownChatRef.current.message);
+          }
+          drawNameTag(ctx, cx, tagTop - 10, playerName);
+        }
+
+        // Draw remote wombats
+        const nowMs = Date.now();
+        for (const rp of remotePlayersRef.current.values()) {
+          const rImg = wombatImgs[rp.spriteVariant];
+          if (!rImg?.complete) continue;
+          const rsx = rp.animFrameIdx * SPRITE_SIZE;
+          const rsy = rp.animRow * SPRITE_SIZE;
+          ctx.save();
+          ctx.translate(rp.x + DISPLAY_SIZE / 2, rp.y + HEAD_PIVOT_Y);
+          if (!rp.facingRight) ctx.scale(-1, 1);
+          ctx.drawImage(rImg, rsx, rsy, SPRITE_SIZE, SPRITE_SIZE, -DISPLAY_SIZE / 2, -HEAD_PIVOT_Y, DISPLAY_SIZE, DISPLAY_SIZE);
           ctx.restore();
+          const rcx = rp.x + DISPLAY_SIZE / 2;
+          const rTop = rp.y + HEAD_PIVOT_Y - 2;
+          if (rp.chatMsg && nowMs - rp.chatTs < 5000) {
+            drawChatBubble(ctx, rcx, rTop - 28, rp.chatMsg);
+          }
+          drawNameTag(ctx, rcx, rTop - 10, rp.name);
         }
       }
 
@@ -762,5 +951,176 @@ export default function WombatCanvas() {
     };
   }, []);
 
-  return <canvas ref={canvasRef} style={{ display: 'block', imageRendering: 'pixelated', touchAction: 'none' }} />;
+  // Supabase multiplayer
+  useEffect(() => {
+    const channel = supabase.channel('wombat-room', {
+      config: { presence: { key: playerId } },
+    });
+    channelRef.current = channel;
+
+    channel
+      .on('presence', { event: 'sync' }, () => {
+        const state = channel.presenceState<RemotePlayer>();
+        const map = new Map<string, RemotePlayer>();
+        for (const presences of Object.values(state)) {
+          for (const p of presences as RemotePlayer[]) {
+            if (p.playerId !== playerId) map.set(p.playerId, p);
+          }
+        }
+        remotePlayersRef.current = map;
+      })
+      .on('broadcast', { event: 'chat' }, ({ payload }: { payload: ChatMessage }) => {
+        setChatHistory(prev => [...prev.slice(-49), payload]);
+      })
+      .subscribe();
+
+    const interval = setInterval(() => {
+      const s = statesRef.current[0];
+      if (!s || !channelRef.current) return;
+      const step = s.seq[s.stepIdx];
+      channelRef.current.track({
+        playerId, name: playerName,
+        spriteVariant: s.spriteVariant,
+        x: Math.round(s.x), y: Math.round(s.y),
+        facingRight: s.facingRight,
+        animRow: ANIMS[step.anim].row,
+        animFrameIdx: getFrameIdx(s.elapsed, step.anim),
+        chatMsg: ownChatRef.current.message,
+        chatTs: ownChatRef.current.ts,
+      });
+    }, 200);
+
+    return () => {
+      clearInterval(interval);
+      channel.unsubscribe();
+    };
+  }, [playerId, playerName]);
+
+  const playerColor = PLAYER_COLORS[ownVariant] ?? '#888';
+
+  const [chatPos, setChatPos] = useState<{ x: number; y: number } | null>(() => {
+    try {
+      const saved = localStorage.getItem('wombat_chat_pos');
+      return saved ? JSON.parse(saved) : null;
+    } catch { return null; }
+  });
+  const chatPanelRef = useRef<HTMLDivElement>(null);
+  const chatDragRef = useRef<{ dragging: boolean; startX: number; startY: number; startPosX: number; startPosY: number }>({
+    dragging: false, startX: 0, startY: 0, startPosX: 0, startPosY: 0,
+  });
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent | TouchEvent) => {
+      if (!chatDragRef.current.dragging) return;
+      const cx = e instanceof MouseEvent ? e.clientX : e.touches[0].clientX;
+      const cy = e instanceof MouseEvent ? e.clientY : e.touches[0].clientY;
+      const dx = cx - chatDragRef.current.startX;
+      const dy = cy - chatDragRef.current.startY;
+      const newPos = { x: chatDragRef.current.startPosX + dx, y: chatDragRef.current.startPosY + dy };
+      setChatPos(newPos);
+      localStorage.setItem('wombat_chat_pos', JSON.stringify(newPos));
+    };
+    const onUp = () => { chatDragRef.current.dragging = false; };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    window.addEventListener('touchmove', onMove, { passive: true });
+    window.addEventListener('touchend', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('touchmove', onMove);
+      window.removeEventListener('touchend', onUp);
+    };
+  }, []);
+
+  const startChatDrag = (e: React.MouseEvent | React.TouchEvent) => {
+    e.stopPropagation();
+    const cx = 'touches' in e ? e.touches[0].clientX : e.clientX;
+    const cy = 'touches' in e ? e.touches[0].clientY : e.clientY;
+    const rect = chatPanelRef.current?.getBoundingClientRect();
+    const posX = rect ? rect.left : (chatPos?.x ?? 16);
+    const posY = rect ? rect.top : (chatPos?.y ?? (window.innerHeight - 300));
+    chatDragRef.current = { dragging: true, startX: cx, startY: cy, startPosX: posX, startPosY: posY };
+  };
+
+  return (
+    <div style={{ position: 'relative', width: '100vw', height: '100vh', overflow: 'hidden' }}>
+      <canvas ref={canvasRef} style={{ display: 'block', imageRendering: 'pixelated', touchAction: 'none' }} />
+
+      {/* Chat Panel */}
+      <div
+        onMouseDown={(e) => e.stopPropagation()}
+        onTouchStart={(e) => e.stopPropagation()}
+        ref={chatPanelRef}
+        style={{
+          position: 'absolute',
+          ...(chatPos ? { left: chatPos.x, top: chatPos.y } : { left: 16, bottom: 16 }),
+          width: 300,
+          background: '#3a2e20', borderRadius: 12, overflow: 'hidden',
+          boxShadow: '0 4px 24px rgba(0,0,0,0.45)',
+          display: 'flex', flexDirection: 'column', zIndex: 10,
+        }}
+      >
+        <div
+          onMouseDown={startChatDrag}
+          onTouchStart={startChatDrag}
+          style={{ padding: '8px 14px', display: 'flex', alignItems: 'center', gap: 6, cursor: 'grab', userSelect: 'none' }}
+        >
+          <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#27ae60' }} />
+          <span style={{ color: '#fff', fontWeight: 'bold', fontSize: 13, fontFamily: 'sans-serif' }}>Chat</span>
+          <span style={{ color: '#666', fontSize: 10, fontFamily: 'sans-serif', marginLeft: 'auto' }}>⠿</span>
+        </div>
+
+        <div
+          ref={chatScrollRef}
+          style={{ maxHeight: 180, minHeight: 60, overflowY: 'auto', padding: '4px 0' }}
+        >
+          {chatHistory.length === 0 && (
+            <p style={{ color: '#666', fontSize: 11, textAlign: 'center', fontFamily: 'sans-serif', margin: '8px 0' }}>
+              ยังไม่มีข้อความ...
+            </p>
+          )}
+          {chatHistory.map(msg => (
+            <div key={msg.id} style={{
+              display: 'flex', alignItems: 'baseline', gap: 4,
+              padding: '4px 10px', margin: '1px 8px',
+              borderLeft: `3px solid ${PLAYER_COLORS[msg.spriteVariant] ?? '#888'}`,
+              borderRadius: 2,
+            }}>
+              <span style={{ color: PLAYER_COLORS[msg.spriteVariant] ?? '#888', fontWeight: 'bold', fontSize: 12, fontFamily: 'sans-serif', whiteSpace: 'nowrap' }}>
+                {msg.name}
+              </span>
+              <span style={{ color: '#d0c0a0', fontSize: 12, fontFamily: 'sans-serif' }}>: {msg.text}</span>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display: 'flex', gap: 6, padding: '8px 10px', borderTop: '1px solid #4a3e28', background: '#2a2016' }}>
+          <input
+            type="text"
+            placeholder="พิมข้อความ...."
+            value={chatInput}
+            maxLength={100}
+            onChange={(e) => setChatInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleSendChat(); }}
+            style={{
+              flex: 1, padding: '6px 10px', borderRadius: 6, border: 'none',
+              background: '#3a3220', color: '#fff', fontSize: 12,
+              fontFamily: 'sans-serif', outline: 'none',
+            }}
+          />
+          <button
+            onClick={handleSendChat}
+            style={{
+              padding: '6px 14px', background: playerColor, color: '#fff',
+              border: 'none', borderRadius: 6, fontSize: 12,
+              fontFamily: 'sans-serif', cursor: 'pointer', fontWeight: 'bold',
+            }}
+          >
+            send
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
